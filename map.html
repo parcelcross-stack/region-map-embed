@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Region Map</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; }
+    #map { width:100%; height:100vh; }
+    #badge{
+      position:fixed; left:12px; top:12px; z-index:9999;
+      background:rgba(255,255,255,.95); border:1px solid #e5e5e5;
+      border-radius:10px; padding:8px 10px; font-size:12px; color:#333;
+      max-width: calc(100vw - 24px);
+    }
+  </style>
+</head>
+<body>
+  <div id="badge">지도 준비 중...</div>
+  <div id="map"></div>
+
+  <script>
+    // ✅ 카카오 JavaScript 키
+    const KAKAO_JS_KEY = '1a6c6e8c06a7b9d4ca65358df3cbf1b3';
+
+    // ✅ GitHub Pages base (네 Pages 주소 기준)
+    const PAGES_BASE = 'https://01a6rl4b-arch.github.io/region-map-embed';
+
+    // ✅ (중요) Pages에서 CSV가 404가 날 수 있어 RAW로 고정 (너가 RAW는 열리는 것 확인함)
+    const MAP_CSV_URL =
+      'https://raw.githubusercontent.com/01a6rl4b-arch/region-map-embed/main/geo/bjcd_name_map_unique.csv';
+
+    // ✅ BJCD별 GeoJSON 폴더 (Pages에 업로드된 out_bjcd 사용)
+    const GEO_BASE = `${PAGES_BASE}/geo/out_bjcd`;
+
+    function setBadge(msg){ document.getElementById('badge').textContent = msg; }
+
+    function loadKakaoSdk(appKey){
+      return new Promise((resolve, reject) => {
+        if (window.kakao && kakao.maps && typeof kakao.maps.load === 'function') {
+          kakao.maps.load(resolve);
+          return;
+        }
+        const s = document.createElement('script');
+        s.src = 'https://dapi.kakao.com/v2/maps/sdk.js?appkey=' + encodeURIComponent(appKey) + '&autoload=false';
+        s.onload = () => {
+          if (window.kakao && kakao.maps && typeof kakao.maps.load === 'function') kakao.maps.load(resolve);
+          else reject(new Error('kakao.maps.load 없음'));
+        };
+        s.onerror = () => reject(new Error('Kakao SDK 로드 실패(도메인 등록 확인)'));
+        document.head.appendChild(s);
+      });
+    }
+
+    // 한글 행정구역 “미세 보정” (필요 시 추가)
+    function normalizeName(s){
+      return (s || '').trim();
+    }
+
+    // CSV 파서: BJCD,NAME (간단 split)
+    function parseCSV(text){
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      const out = [];
+      for (let i=1; i<lines.length; i++){ // header skip
+        const line = lines[i];
+        const parts = line.split(',');
+        if (parts.length < 2) continue;
+        const bjcd = parts[0].replace(/"/g,'').trim();
+        const name = parts.slice(1).join(',').replace(/"/g,'').trim();
+        if (bjcd && name) out.push({ bjcd, name });
+      }
+      return out;
+    }
+
+    // 시도명 -> 시도코드(앞2자리) (동명이구 해결용)
+    const sidoMap = {
+      "서울특별시": "11",
+      "부산광역시": "26",
+      "대구광역시": "27",
+      "인천광역시": "28",
+      "광주광역시": "29",
+      "대전광역시": "30",
+      "울산광역시": "31",
+      "세종특별자치시": "36",
+      "경기도": "41",
+      "강원특별자치도": "42",
+      "충청북도": "43",
+      "충청남도": "44",
+      "전북특별자치도": "45",
+      "전라남도": "46",
+      "경상북도": "47",
+      "경상남도": "48",
+      "제주특별자치도": "50"
+    };
+
+    function toLatLngPath(ring){
+      // ring: [[lng,lat], ...]
+      return ring.map(c => new kakao.maps.LatLng(c[1], c[0]));
+    }
+
+    function drawGeoJSON(map, geo){
+      const bounds = new kakao.maps.LatLngBounds();
+      let drawn = 0;
+
+      const makePoly = (path) => {
+        path.forEach(p => bounds.extend(p));
+        const polygon = new kakao.maps.Polygon({
+          map,
+          path,
+          strokeWeight: 2,
+          strokeColor: '#0052CC',
+          strokeOpacity: 0.9,
+          fillColor: '#99c2ff',
+          fillOpacity: 0.3
+        });
+        drawn++;
+        return polygon;
+      };
+
+      geo.features.forEach(f => {
+        const g = f.geometry;
+        if (!g) return;
+
+        if (g.type === 'Polygon') {
+          // Polygon: coordinates = [ring1, ring2...]
+          // 보통 ring1만 써도 됨(외곽). 필요하면 내부 ring도 추가 가능.
+          const ring = g.coordinates?.[0];
+          if (ring && ring.length >= 3) makePoly(toLatLngPath(ring));
+        } else if (g.type === 'MultiPolygon') {
+          // MultiPolygon: [ [ring1...], [ring1...], ...]
+          g.coordinates.forEach(poly => {
+            const ring = poly?.[0];
+            if (ring && ring.length >= 3) makePoly(toLatLngPath(ring));
+          });
+        }
+      });
+
+      if (!drawn) throw new Error('폴리곤 path 생성 실패');
+      map.setBounds(bounds, 40, 40, 40, 40);
+    }
+
+    async function main(){
+      const params = new URLSearchParams(location.search);
+
+      // 실전은 한글로
+      const sido = normalizeName(params.get('sido') || '서울특별시');
+      const sgg  = normalizeName(params.get('sgg')  || '종로구');
+
+      setBadge(`선택 지역: ${sido} ${sgg} / SDK 로드 중...`);
+      await loadKakaoSdk(KAKAO_JS_KEY);
+
+      setBadge('지도 생성 중...');
+      const map = new kakao.maps.Map(document.getElementById('map'), {
+        center: new kakao.maps.LatLng(37.5665, 126.9780),
+        level: 8
+      });
+
+      // 1) 매핑 CSV 로드
+      setBadge('BJCD 매핑 불러오는 중...');
+      const csvRes = await fetch(MAP_CSV_URL, { cache: 'no-store' });
+      if (!csvRes.ok) throw new Error('매핑 CSV HTTP ' + csvRes.status);
+      const rows = parseCSV(await csvRes.text());
+
+      // 2) sgg 이름으로 후보 찾기 (중구/서구 대비)
+      const candidates = rows.filter(r => r.name === sgg);
+      if (!candidates.length) throw new Error(`BJCD 후보 없음: ${sgg}`);
+
+      // 3) sido로 시도코드 추정해 후보 좁히기
+      const expectedSidoCode = sidoMap[sido] || '';
+      let found = null;
+      if (expectedSidoCode) {
+        found = candidates.find(r => String(r.bjcd).startsWith(expectedSidoCode));
+      }
+      if (!found) found = candidates[0]; // fallback
+
+      const bjcd = String(found.bjcd);      // 예: 1111000000
+      const sidoCode = bjcd.slice(0,2);     // 예: 11
+
+      // 4) BJCD GeoJSON 로드
+      const geoUrl = `${GEO_BASE}/${encodeURIComponent(sidoCode)}/${encodeURIComponent(bjcd)}.geojson`;
+      setBadge(`경계 데이터 불러오는 중... (${bjcd})`);
+
+      const geoRes = await fetch(geoUrl, { cache: 'no-store' });
+      if (!geoRes.ok) throw new Error('GeoJSON HTTP ' + geoRes.status);
+      const geo = await geoRes.json();
+
+      // 5) 폴리곤 그리기 + bounds 맞춤
+      drawGeoJSON(map, geo);
+
+      setBadge(`완료: ${sido} ${sgg} (${bjcd})`);
+    }
+
+    main().catch(err => {
+      console.error(err);
+      setBadge('오류: ' + err.message);
+    });
+  </script>
+</body>
+</html>
